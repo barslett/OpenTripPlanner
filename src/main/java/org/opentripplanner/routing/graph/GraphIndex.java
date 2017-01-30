@@ -94,8 +94,8 @@ public class GraphIndex {
     public final Multimap<Stop, TripPattern> patternsForStop = ArrayListMultimap.create();
     public final Multimap<String, Stop> stopsForParentStation = ArrayListMultimap.create();
     final HashGridSpatialIndex<TransitStop> stopSpatialIndex = new HashGridSpatialIndex<TransitStop>();
-    public final Map<Stop, StopCluster> stopClusterForStop = Maps.newHashMap();
-    public final Map<String, StopCluster> stopClusterForId = Maps.newHashMap();
+    private final Map<Stop, StopCluster> stopClusterForStop = Maps.newHashMap();
+    private final Map<String, StopCluster> stopClusterForId = Maps.newHashMap();
 
     /* Should eventually be replaced with new serviceId indexes. */
     private final CalendarService calendarService;
@@ -383,8 +383,8 @@ public class GraphIndex {
      * Fetch upcoming vehicle departures from a stop.
      * Fetches two departures for each pattern during the next 24 hours as default
      */
-    public Collection<StopTimesInPattern> stopTimesForStop(Stop stop) {
-        return stopTimesForStop(stop, System.currentTimeMillis()/1000, 24 * 60 * 60, 2);
+    public Collection<StopTimesInPattern> stopTimesForStop(Stop stop, boolean omitNonPickups) {
+        return stopTimesForStop(stop, System.currentTimeMillis()/1000, 24 * 60 * 60, 2, omitNonPickups);
     }
 
     /**
@@ -399,9 +399,10 @@ public class GraphIndex {
      * @param startTime Start time for the search. Seconds from UNIX epoch
      * @param timeRange Searches forward for timeRange seconds from startTime
      * @param numberOfDepartures Number of departures to fetch per pattern
+     * @param omitNonPickups If departures with pickup restrictions should be included or not
      * @return
      */
-    public List<StopTimesInPattern> stopTimesForStop(Stop stop, long startTime, int timeRange, int numberOfDepartures) {
+    public List<StopTimesInPattern> stopTimesForStop(Stop stop, long startTime, int timeRange, int numberOfDepartures, boolean omitNonPickups) {
 
         if (startTime == 0) {
             startTime = System.currentTimeMillis() / 1000;
@@ -441,8 +442,8 @@ public class GraphIndex {
                 int sidx = 0;
                 for (Stop currStop : pattern.stopPattern.stops) {
                     if (currStop == stop) {
-                    	if(pattern.stopPattern.pickups[sidx] == pattern.stopPattern.PICKDROP_NONE) continue;
-                    	for (TripTimes t : tt.tripTimes) {
+                        if(omitNonPickups && pattern.stopPattern.pickups[sidx] == pattern.stopPattern.PICKDROP_NONE) continue;
+                        for (TripTimes t : tt.tripTimes) {
                             if (!sd.serviceRunning(t.serviceCode)) continue;
                             if (t.getDepartureTime(sidx) != -1 &&
                                     t.getDepartureTime(sidx) >= secondsSinceMidnight) {
@@ -488,7 +489,7 @@ public class GraphIndex {
      * @param serviceDate Return all departures for the specified date
      * @return
      */
-    public List<StopTimesInPattern> getStopTimesForStop(Stop stop, ServiceDate serviceDate) {
+    public List<StopTimesInPattern> getStopTimesForStop(Stop stop, ServiceDate serviceDate, boolean omitNonPickups) {
         List<StopTimesInPattern> ret = new ArrayList<>();
         TimetableSnapshot snapshot = null;
         if (graph.timetableSnapshotSource != null) {
@@ -507,6 +508,7 @@ public class GraphIndex {
             int sidx = 0;
             for (Stop currStop : pattern.stopPattern.stops) {
                 if (currStop == stop) {
+                    if(omitNonPickups && pattern.stopPattern.pickups[sidx] == pattern.stopPattern.PICKDROP_NONE) continue;
                     for (TripTimes t : tt.tripTimes) {
                         if (!sd.serviceRunning(t.serviceCode)) continue;
                         stopTimes.times.add(new TripTimeShort(t, sidx, stop, sd));
@@ -548,11 +550,13 @@ public class GraphIndex {
     }
 
     /**
+     * Stop clusters can be built in one of two ways, either by geographical proximity, or 
+     * according to a parent/child station topology, if it exists.
+     * 
+     * Some challenges faced by DC and Trimet:
      * FIXME OBA parentStation field is a string, not an AgencyAndId, so it has no agency/feed scope
      * But the DC regional graph has no parent stations pre-defined, so no use dealing with them for now.
      * However Trimet stops have "landmark" or Transit Center parent stations, so we don't use the parent stop field.
-     *
-     * Ideally in the future stop clusters will replicate and/or share implementation with GTFS parent stations.
      *
      * We can't use a similarity comparison, we need exact matches. This is because many street names differ by only
      * one letter or number, e.g. 34th and 35th or Avenue A and Avenue B.
@@ -561,25 +565,76 @@ public class GraphIndex {
      * stops -- no guessing is reasonable without that information.
      */
     public void clusterStops() {
-    	LOG.info("Clustering stops by parent station...");
-    	Map<String, StopCluster> parentStopsMap = new HashMap();
-    	for (Stop s0 : stopForId.values()) {
-    		String ps = s0.getParentStation();
-    		parentStopsMap.put(ps, new StopCluster(ps, s0.getName()));
-    		}
-    	for (Stop s0 : stopForId.values()) {
-    		String ps = s0.getParentStation();
-    		if(!parentStopsMap.containsKey(ps)) continue;
-    		StopCluster cluster = parentStopsMap.get(ps);
-    		cluster.children.add(s0);
-    		stopClusterForStop.put(s0, cluster);
-    	}
-    	for (Map.Entry<String, StopCluster> cluster : parentStopsMap.entrySet()) {
-    		cluster.getValue().computeCenter();
-    		stopClusterForId.put(cluster.getKey(), cluster.getValue());
-    	}
+    	if (graph.stopClusterMode != null) {
+            switch (graph.stopClusterMode) {
+                case "parentStation":
+                    clusterByParentStation();
+                    break;
+                case "proximity":
+                    clusterByProximity();
+                    break;
+                default:
+                    clusterByProximity();
+            }
+        } else {
+            clusterByProximity();
+        }
     }
     
+    private void clusterByProximity() {	
+    	int psIdx = 0; // unique index for next parent stop
+	    LOG.info("Clustering stops by geographic proximity and name...");
+	    // Each stop without a cluster will greedily claim other stops without clusters.
+	    for (Stop s0 : stopForId.values()) {
+	        if (stopClusterForStop.containsKey(s0)) continue; // skip stops that have already been claimed by a cluster
+	        String s0normalizedName = StopNameNormalizer.normalize(s0.getName());
+	        StopCluster cluster = new StopCluster(String.format("C%03d", psIdx++), s0normalizedName);
+	        // LOG.info("stop {}", s0normalizedName);
+	        // No need to explicitly add s0 to the cluster. It will be found in the spatial index query below.
+	        Envelope env = new Envelope(new Coordinate(s0.getLon(), s0.getLat()));
+	        env.expandBy(SphericalDistanceLibrary.metersToLonDegrees(CLUSTER_RADIUS, s0.getLat()),
+	                SphericalDistanceLibrary.metersToDegrees(CLUSTER_RADIUS));
+	        for (TransitStop ts1 : stopSpatialIndex.query(env)) {
+	            Stop s1 = ts1.getStop();
+	            double geoDistance = SphericalDistanceLibrary.fastDistance(
+	                    s0.getLat(), s0.getLon(), s1.getLat(), s1.getLon());
+	            if (geoDistance < CLUSTER_RADIUS) {
+	                String s1normalizedName = StopNameNormalizer.normalize(s1.getName());
+	                // LOG.info("   --> {}", s1normalizedName);
+	                // LOG.info("       geodist {} stringdist {}", geoDistance, stringDistance);
+	                if (s1normalizedName.equals(s0normalizedName)) {
+	                    // Create a bidirectional relationship between the stop and its cluster
+	                    cluster.children.add(s1);
+	                    stopClusterForStop.put(s1, cluster);
+	                }
+	            }
+	        }
+	        cluster.computeCenter();
+	        stopClusterForId.put(cluster.id, cluster);
+	    }
+    }
+    private void clusterByParentStation() {
+        LOG.info("Clustering stops by parent station...");
+    	for (Stop stop : stopForId.values()) {
+    	    String ps = stop.getParentStation();
+    	    if (ps == null || ps.isEmpty()) {
+    	        continue;
+    	    }
+    	    StopCluster cluster;
+    	    if (stopClusterForId.containsKey(ps)) {
+    	        cluster = stopClusterForId.get(ps);
+    	    } else {
+    	        cluster = new StopCluster(ps, stop.getName());
+    	        stopClusterForId.put(ps, cluster);
+	    }
+    	    cluster.children.add(stop);
+    	    stopClusterForStop.put(stop, cluster);    
+    	}
+    	for (Map.Entry<String, StopCluster> cluster : stopClusterForId.entrySet()) {
+    	    cluster.getValue().computeCenter();
+    	}
+    }
+
     public Response getGraphQLResponse(String query, Map<String, Object> variables) {
         ExecutionResult executionResult = graphQL.execute(query, null, null, variables);
         Response.ResponseBuilder res = Response.status(Response.Status.OK);
@@ -626,6 +681,16 @@ public class GraphIndex {
             allAgencies.addAll(agencyForId.values());
         }
         return allAgencies;
+    }
+
+    public Map<Stop, StopCluster> getStopClusterForStop() {
+        clusterStopsAsNeeded();
+        return stopClusterForStop;
+    }
+
+    public Map<String, StopCluster> getStopClusterForId() {
+        clusterStopsAsNeeded();
+        return stopClusterForId;
     }
 
 }
